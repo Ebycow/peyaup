@@ -108,11 +108,6 @@ export async function notifyIncident(client: Client, config: AppConfig): Promise
 }
 
 export async function registerSpinCommands(client: Client, guildId: string, logger: Logger): Promise<void> {
-  const application = client.application;
-  if (!application) {
-    throw new Error("Discord application is not available after ready event");
-  }
-
   const guild = await client.guilds.fetch(guildId);
   const guildCommands = await guild.commands.fetch();
   for (const payload of SPIN_COMMAND_PAYLOADS) {
@@ -128,21 +123,6 @@ export async function registerSpinCommands(client: Client, guildId: string, logg
     logger.info(`Guild slash command /${payload.name} created for guild ${guildId}.`);
   }
 
-  // Prevent duplicate display by removing legacy global commands with the same names.
-  try {
-    const globalCommands = await application.commands.fetch();
-    for (const payload of SPIN_COMMAND_PAYLOADS) {
-      const existing = globalCommands.find((command) => command.name === payload.name);
-      if (!existing) {
-        continue;
-      }
-
-      await application.commands.delete(existing.id);
-      logger.info(`Global slash command /${payload.name} deleted to avoid duplicate entries.`);
-    }
-  } catch (error) {
-    logger.warn("Failed to clean up global spin commands.", error);
-  }
 }
 
 async function executeSpin(interaction: ChatInputCommandInteraction): Promise<void> {
