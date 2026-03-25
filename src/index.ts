@@ -49,7 +49,6 @@ const tvCtx: TvCommandContext | null =
   config.tvtestApiUrl !== null
     ? {
         baseUrl: config.tvtestApiUrl,
-        bonDrivers: config.tvtestBonDrivers,
         tuningDelays: config.tvtestTuningDelays,
         channels: [],
       }
@@ -102,7 +101,7 @@ client.once("ready", () => {
       try {
         const discovered = await discoverAllChannels(
           tvCtx.baseUrl,
-          tvCtx.bonDrivers,
+          config.tvtestBonDrivers,
           logger,
           tvCtx.tuningDelays,
         );

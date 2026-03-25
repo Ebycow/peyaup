@@ -54,7 +54,7 @@ const UNCATEGORIZED_NETWORK_NAME = "未分類";
 /**
  * 指定した BonDriver を順番に切り替えてチャンネルを列挙し、元の Driver に戻す。
  * drivers が空の場合は現在のドライバのみを対象にする。
- * 起動時または /tv reload コマンドで呼び出す。
+ * 起動時のチャンネル探索で呼び出す。
  */
 export async function discoverAllChannels(
   baseUrl: string,

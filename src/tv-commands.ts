@@ -8,7 +8,6 @@ import {
 import type { Logger } from "./logger.js";
 import {
   buildChannelChoiceLabel,
-  discoverAllChannels,
   encodeChannelSelectionValue,
   findChannel,
   getCurrentChannel,
@@ -28,7 +27,6 @@ const TV_COMMAND_NAME = "tv";
 const SUBCOMMAND_CHANNEL = "channel";
 const SUBCOMMAND_LIST = "list";
 const SUBCOMMAND_STATUS = "status";
-const SUBCOMMAND_RELOAD = "reload";
 const CHANNEL_LIST_PAGE_SIZE = 15;
 const AUTOCOMPLETE_RESULT_LIMIT = 25;
 const CHANNEL_PROGRAM_CACHE_TTL_MS = 15000;
@@ -55,8 +53,6 @@ const channelProgramCache = new Map<string, CachedChannelProgram>();
 
 export interface TvCommandContext {
   baseUrl: string;
-  /** 走査対象の BonDriver ファイル名リスト (TVTEST_BON_DRIVERS) */
-  bonDrivers: string[];
   /** BonDriver 切替・選局まわりの待機設定 */
   tuningDelays: TvTuningDelays;
   channels: UnifiedChannel[];
@@ -99,9 +95,6 @@ export function buildTvCommandPayload(): RESTPostAPIChatInputApplicationCommands
     .addSubcommand((sub) =>
       sub.setName(SUBCOMMAND_STATUS).setDescription("現在視聴中のチャンネルと番組情報を表示する"),
     )
-    .addSubcommand((sub) =>
-      sub.setName(SUBCOMMAND_RELOAD).setDescription("チャンネル一覧を再スキャンする"),
-    )
     .toJSON();
 }
 
@@ -140,7 +133,7 @@ async function executeChannelChange(
 
   if (!target) {
     await interaction.reply({
-      content: `チャンネル「${query}」が見つかりませんでした。\`/tv reload\` でチャンネル一覧を更新してから再度お試しください。`,
+      content: `チャンネル「${query}」が見つかりませんでした。Bot のチャンネル一覧が古い可能性があります。管理者に再起動を依頼してください。`,
       ephemeral: true,
     });
     return;
@@ -158,7 +151,7 @@ async function executeChannelChange(
         : ""
       : !channelMismatch
         ? "\n番組情報は更新待ちです。"
-        : `\n> 現在の状態では **${reportedChannelName}** が報告されています。チャンネル一覧が古い可能性があるため、\`/tv reload\` をお試しください。`;
+        : `\n> 現在の状態では **${reportedChannelName}** が報告されています。Bot のチャンネル一覧が古い可能性があるため、管理者に再起動を依頼してください。`;
     const driverNote = result.driverSwitched
       ? `\n> BonDriver を \`${target.driver}\` に切り替えました。`
       : "";
@@ -210,7 +203,7 @@ async function executeList(
 ): Promise<void> {
   if (ctx.channels.length === 0) {
     await interaction.reply({
-      content: "チャンネル一覧がまだ読み込まれていません。\`/tv reload\` で再スキャンしてください。",
+      content: "チャンネル一覧がまだ読み込まれていません。管理者に Bot の再起動を依頼してください。",
       ephemeral: true,
     });
     return;
@@ -223,7 +216,7 @@ async function executeList(
   if (matches.length === 0) {
     const content =
       query === ""
-        ? "表示できるチャンネルがありません。\`/tv reload\` で一覧を更新してください。"
+        ? "表示できるチャンネルがありません。管理者に Bot の再起動を依頼してください。"
         : `「${query}」に一致するチャンネルはありませんでした。\`/tv list\` で全体を確認できます。`;
     await interaction.reply({ content, ephemeral: true });
     return;
@@ -266,30 +259,6 @@ async function executeList(
   });
 }
 
-async function executeReload(
-  interaction: ChatInputCommandInteraction,
-  ctx: TvCommandContext,
-  logger: Logger,
-): Promise<void> {
-  await interaction.deferReply({ ephemeral: true });
-
-  try {
-    const discovered = await discoverAllChannels(ctx.baseUrl, ctx.bonDrivers, logger, ctx.tuningDelays);
-    ctx.channels.length = 0;
-    ctx.channels.push(...discovered);
-    clearProgramCache(ctx.baseUrl);
-
-    await interaction.editReply({
-      content: `チャンネル一覧を更新しました。${discovered.length} チャンネルを検出しました。`,
-    });
-  } catch (error) {
-    logger.error("Failed to reload TV channels.", error);
-    await interaction.editReply({
-      content: "チャンネル再スキャン中にエラーが発生しました。TVTest が起動しているか確認してください。",
-    });
-  }
-}
-
 export async function handleTvInteraction(
   interaction: Interaction,
   ctx: TvCommandContext,
@@ -313,8 +282,6 @@ export async function handleTvInteraction(
       await executeList(interaction, ctx, logger);
     } else if (subcommand === SUBCOMMAND_STATUS) {
       await executeStatus(interaction, ctx, logger);
-    } else if (subcommand === SUBCOMMAND_RELOAD) {
-      await executeReload(interaction, ctx, logger);
     }
   } catch (error) {
     logger.error(`Failed to execute /tv ${subcommand}.`, error);
@@ -464,16 +431,6 @@ async function getProgramsForDisplay(
   }
 
   return results;
-}
-
-function clearProgramCache(baseUrl: string): void {
-  const prefix = `${baseUrl.replace(/\/$/, "")}::`;
-
-  for (const key of channelProgramCache.keys()) {
-    if (key.startsWith(prefix)) {
-      channelProgramCache.delete(key);
-    }
-  }
 }
 
 function buildChannelProgramCacheKey(baseUrl: string, channel: UnifiedChannel): string {

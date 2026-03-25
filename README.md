@@ -1,24 +1,51 @@
-# Discord配信停止死活監視Botなどなど
+# peyaup — Discord から TVTest を操作する Bot
 
-特定のDiscordユーザ1名を監視し、以下のどちらかが発生したときに通知チャンネルへアラートを送るBotです。
+Discord のスラッシュコマンドで Windows 上の TVTest をリモート操作できる Bot です。
+チャンネル変更・番組検索・視聴状態確認をすべて Discord から行えます。
 
-- Go Live（配信）がOFFになった
-- VCから離脱した
+## 主な機能
 
-`DEBOUNCE_MS` の間に配信が戻った場合は通知しません。
-また、同一停止状態での重複通知を抑止します。
+### `/tv` — TVTest チャンネル操作
 
-加えて、グローバルスラッシュコマンド `/spin` でギルド絵文字を使った `3x3` スロットを実行できます。
+TVTest の HTTP Plugin API を通じてチャンネルを遠隔操作します。
 
-## 1. 必要なBot権限
+| サブコマンド | 説明 |
+|---|---|
+| `/tv channel name:...` | チャンネルを変更する（オートコンプリート対応） |
+| `/tv list [query] [page]` | チャンネル一覧を表示する（名前・番組名・ネットワーク名で絞り込み可） |
+| `/tv status` | 現在視聴中のチャンネルと番組情報を表示する |
 
-- `Guilds`
-- `GuildVoiceStates`
-- 通知先チャンネルの送信権限
-- `/spin` を使うチャンネルへの送信権限
-- Bot招待時に `applications.commands` スコープ
+#### オートコンプリート検索
 
-## 2. セットアップ
+`/tv channel` の `name` 引数はオートコンプリートに対応しています。入力テキストは以下の順で検索し、スコアの高い順に最大 25 件を返します。
+
+1. チャンネル名（完全一致 > 前方一致 > 部分一致）
+2. 現在放送中の番組名
+3. ネットワーク名
+4. BonDriver 名
+
+番組名はリアルタイムで EPG から取得し、15 秒間キャッシュします。
+
+#### BonDriver 切替
+
+複数の BonDriver（地上波・BS・CS 等）をまたいだ選局に対応しています。
+別 BonDriver のチャンネルを選択すると自動で切り替えてから選局します。
+
+### その他の機能
+
+- **配信停止監視**: 特定ユーザーの Go Live 停止・VC 離脱を検知して通知チャンネルへアラートを送信
+- **`/spin`**: ギルド絵文字を使った 3×3 スロット
+
+---
+
+## セットアップ
+
+### 1. TVTest 側の準備
+
+TVTest HTTP Plugin をインストールし、TVTest を起動しておきます。
+デフォルトポートは `40152` です。
+
+### 2. Bot のセットアップ
 
 ```bash
 cp .env.example .env
@@ -27,19 +54,19 @@ npm install
 npm run build
 ```
 
-## 3. ローカル実行
+### 3. ローカル実行
 
 ```bash
 npm run dev
 ```
 
-## 4. テスト
+### 4. テスト
 
 ```bash
 npm test
 ```
 
-## 5. Docker Compose実行
+### 5. Docker Compose 実行
 
 ```bash
 docker compose up -d --build
@@ -57,30 +84,53 @@ docker compose logs -f watchdog
 docker compose down
 ```
 
-## 6. 環境変数
+---
 
-- `DISCORD_TOKEN` (必須): Botトークン
-- `GUILD_ID` (必須): 監視対象Guild ID
-- `WATCH_USER_ID` (必須): 監視対象ユーザID
-- `MENTION_USER_ID` (任意): 通知時にメンションするユーザID（未指定時は `WATCH_USER_ID`）
-- `INCIDENT_CHANNEL_ID` (必須): 通知先チャンネルID
-- `DEBOUNCE_MS` (任意): 瞬断吸収時間（ms、デフォルト `15000`）
+## 環境変数
 
-## 7. 通知仕様
+### Discord / 監視設定（必須）
 
-- 起動時に監視対象が停止状態なら即通知
-- 停止通知のみ送信（復旧通知なし）
-- 停止状態継続中の重複通知は送信しない
+| 変数名 | 必須 | 説明 |
+|---|---|---|
+| `DISCORD_TOKEN` | ✓ | Bot トークン |
+| `GUILD_ID` | ✓ | 対象 Guild ID |
+| `WATCH_USER_ID` | ✓ | 監視対象ユーザー ID |
+| `MENTION_USER_ID` | | 通知時にメンションするユーザー ID（省略時は `WATCH_USER_ID`） |
+| `INCIDENT_CHANNEL_ID` | ✓ | 通知先チャンネル ID |
+| `DEBOUNCE_MS` | | 瞬断吸収時間 ms（デフォルト `15000`） |
 
-## 8. `/spin` 仕様
+### TVTest 連携設定
 
-- ローカルスラッシュコマンド: `/spin`, `/spin-rate`（`GUILD_ID` のギルドに登録）
-- 起動時にこの Bot のグローバルコマンドは全削除し、`GUILD_ID` のギルドコマンドは現在の実装に必要なものだけへ同期
-- 実行場所: ギルド内のみ（DM非対応）
-- 使用絵文字: 実行ギルドに存在するカスタム絵文字
-- 盤面: `3x3`
-- 抽選: 全9マス独立の完全ランダム（重みなし）
-- 演出: 列ごとに約1秒遅延で停止し、同一メッセージを更新
-- 当選判定: `8ライン`（横3 + 縦3 + 斜め2）
-- ギルド絵文字が0件の場合: 実行不可メッセージを返して終了
-- `/spin-rate` は、そのギルドの絵文字数を使った `/spin` 当選確率を表示
+| 変数名 | 必須 | 説明 |
+|---|---|---|
+| `TVTEST_API_URL` | | TVTest HTTP Plugin の URL（例: `http://192.168.1.10:40152`）。省略時は TV 機能が無効になります |
+| `TVTEST_BON_DRIVERS` | | チャンネルスキャン対象の BonDriver をカンマ区切りで指定（例: `BonDriver_Proxy_T.dll,BonDriver_Proxy_S.dll`）。省略時は起動時にロード中のドライバのみスキャン |
+| `TVTEST_POST_DRIVER_SWITCH_DELAY_MS` | | BonDriver 切替後の待機時間 ms（デフォルト `1200`）。TS ドロップが出る場合は `1500〜3000` 程度に増やす |
+| `TVTEST_POST_CHANNEL_CHANGE_DELAY_MS` | | チャンネル変更後の待機時間 ms（デフォルト `500`） |
+
+TVTest が別 PC にある場合は `TVTEST_API_URL` に Windows 機の IP を指定してください。
+
+---
+
+## 必要な Bot 権限
+
+- `Guilds`
+- `GuildVoiceStates`
+- 通知先チャンネルへの送信権限
+- `/spin` `/tv` を使うチャンネルへの送信権限
+- Bot 招待時に `applications.commands` スコープ
+
+---
+
+## TVTest HTTP Plugin API を使用します
+
+本 Bot は以下のエンドポイントを使用します。
+
+| メソッド | パス | 用途 |
+|---|---|---|
+| GET | `/api/status` | 現在のチャンネル・番組・音量情報を取得 |
+| GET | `/api/channels` | チャンネル一覧を取得 |
+| GET | `/api/driver` | BonDriver 情報を取得 |
+| POST | `/api/channel` | チャンネルを変更 |
+| POST | `/api/driver` | BonDriver を切り替えてチャンネルを変更 |
+| POST | `/api/program/channels` | 複数チャンネルの現在番組情報を一括取得 |
