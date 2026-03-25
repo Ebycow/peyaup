@@ -26,6 +26,35 @@ export interface TvTestProgramInfo {
   text: string;
 }
 
+export interface TvTestEpgProgramInfo {
+  eventId: number;
+  name: string;
+  text: string;
+  startTime: string;
+  endTime: string;
+  duration: number;
+}
+
+export interface TvTestChannelProgramResult {
+  networkId: number;
+  transportStreamId: number;
+  serviceId: number;
+  fetchedAt: string;
+  status: string;
+  program: TvTestEpgProgramInfo | null;
+}
+
+export type TvTestProgramChannelQuery =
+  | {
+      networkId: number;
+      serviceId: number;
+      transportStreamId?: number;
+    }
+  | {
+      space: number;
+      channel: number;
+    };
+
 export interface TvTestStatus {
   channel: TvTestChannelInfo | null;
   volume: number;
@@ -51,7 +80,7 @@ async function getJson<T>(baseUrl: string, path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-async function postJson<T>(baseUrl: string, path: string, body: Record<string, unknown>): Promise<T> {
+async function postJson<T>(baseUrl: string, path: string, body: unknown): Promise<T> {
   const response = await fetch(buildUrl(baseUrl, path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -69,6 +98,23 @@ export async function tvGetStatus(baseUrl: string): Promise<TvTestStatus> {
 
 export async function tvGetChannels(baseUrl: string): Promise<TvTestChannelEntry[]> {
   return getJson<TvTestChannelEntry[]>(baseUrl, "/api/channels");
+}
+
+export async function tvGetProgramsForChannels(
+  baseUrl: string,
+  channels: ReadonlyArray<TvTestProgramChannelQuery>,
+): Promise<TvTestChannelProgramResult[]> {
+  if (channels.length === 0) {
+    return [];
+  }
+
+  const response = await postJson<TvTestChannelProgramResult | TvTestChannelProgramResult[]>(
+    baseUrl,
+    "/api/program/channels",
+    channels,
+  );
+
+  return Array.isArray(response) ? response : [response];
 }
 
 export async function tvGetDriver(baseUrl: string): Promise<TvTestDriverInfo> {

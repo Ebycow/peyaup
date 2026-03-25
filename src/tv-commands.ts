@@ -12,14 +12,17 @@ import {
   encodeChannelSelectionValue,
   findChannel,
   getCurrentChannel,
-  searchAllChannels,
   searchChannels,
   summarizeChannelsByNetwork,
   tuneToChannel,
   type TvTuningDelays,
   type UnifiedChannel,
 } from "./tv-channels.js";
-import { tvGetStatus } from "./tvtest.js";
+import {
+  tvGetProgramsForChannels,
+  tvGetStatus,
+  type TvTestChannelProgramResult,
+} from "./tvtest.js";
 
 const TV_COMMAND_NAME = "tv";
 const SUBCOMMAND_CHANNEL = "channel";
@@ -27,6 +30,28 @@ const SUBCOMMAND_LIST = "list";
 const SUBCOMMAND_STATUS = "status";
 const SUBCOMMAND_RELOAD = "reload";
 const CHANNEL_LIST_PAGE_SIZE = 15;
+const AUTOCOMPLETE_RESULT_LIMIT = 25;
+const CHANNEL_PROGRAM_CACHE_TTL_MS = 15000;
+const AUTOCOMPLETE_CHOICE_NAME_LIMIT = 100;
+const LIST_PROGRAM_NAME_LIMIT = 36;
+
+interface CachedChannelProgram {
+  expiresAtMs: number;
+  result: TvTestChannelProgramResult;
+}
+
+interface SearchChannelsResult {
+  matches: UnifiedChannel[];
+  programs: Map<string, TvTestChannelProgramResult>;
+}
+
+interface RankedChannelWithProgram {
+  channel: UnifiedChannel;
+  score: number;
+  index: number;
+}
+
+const channelProgramCache = new Map<string, CachedChannelProgram>();
 
 export interface TvCommandContext {
   baseUrl: string;
@@ -48,7 +73,7 @@ export function buildTvCommandPayload(): RESTPostAPIChatInputApplicationCommands
         .addStringOption((opt) =>
           opt
             .setName("name")
-            .setDescription("チャンネル名（入力で候補を絞り込めます）")
+            .setDescription("チャンネル名や番組名で候補を絞り込めます")
             .setRequired(true)
             .setAutocomplete(true),
         ),
@@ -60,7 +85,7 @@ export function buildTvCommandPayload(): RESTPostAPIChatInputApplicationCommands
         .addStringOption((opt) =>
           opt
             .setName("query")
-            .setDescription("チャンネル名やネットワーク名で絞り込む")
+            .setDescription("チャンネル名・番組名・ネットワーク名で絞り込む")
             .setRequired(false),
         )
         .addIntegerOption((opt) =>
@@ -80,17 +105,29 @@ export function buildTvCommandPayload(): RESTPostAPIChatInputApplicationCommands
     .toJSON();
 }
 
-export function handleTvAutocomplete(interaction: AutocompleteInteraction, ctx: TvCommandContext): void {
-  const focused = interaction.options.getFocused();
-  const matches = searchChannels(ctx.channels, focused);
-  const duplicateBaseLabels = getDuplicateBaseLabels(ctx.channels);
+export async function handleTvAutocomplete(
+  interaction: AutocompleteInteraction,
+  ctx: TvCommandContext,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const focused = interaction.options.getFocused();
+    const { matches, programs } = await searchChannelsForAutocomplete(ctx.baseUrl, ctx.channels, focused, logger);
+    const duplicateBaseLabels = getDuplicateBaseLabels(ctx.channels);
 
-  void interaction.respond(
-    matches.map((ch) => ({
-      name: buildChannelChoiceLabel(ch, duplicateBaseLabels),
-      value: encodeChannelSelectionValue(ch),
-    })),
-  );
+    await interaction.respond(
+      matches.map((ch) => ({
+        name: buildAutocompleteChoiceName(
+          ch,
+          duplicateBaseLabels,
+          programs.get(buildChannelProgramCacheKey(ctx.baseUrl, ch)),
+        ),
+        value: encodeChannelSelectionValue(ch),
+      })),
+    );
+  } catch (error) {
+    logger.warn("Failed to provide /tv autocomplete choices.", error);
+  }
 }
 
 async function executeChannelChange(
@@ -99,7 +136,7 @@ async function executeChannelChange(
   logger: Logger,
 ): Promise<void> {
   const query = interaction.options.getString("name", true);
-  const target = findChannel(ctx.channels, query);
+  const target = await findChannelForQuery(ctx.baseUrl, ctx.channels, query, logger);
 
   if (!target) {
     await interaction.reply({
@@ -169,6 +206,7 @@ async function executeStatus(
 async function executeList(
   interaction: ChatInputCommandInteraction,
   ctx: TvCommandContext,
+  logger: Logger,
 ): Promise<void> {
   if (ctx.channels.length === 0) {
     await interaction.reply({
@@ -180,7 +218,7 @@ async function executeList(
 
   const query = interaction.options.getString("query")?.trim() ?? "";
   const requestedPage = interaction.options.getInteger("page") ?? 1;
-  const matches = searchAllChannels(ctx.channels, query);
+  const { matches, programs } = await searchChannelsForList(ctx.baseUrl, ctx.channels, query, logger);
 
   if (matches.length === 0) {
     const content =
@@ -208,9 +246,14 @@ async function executeList(
   const pageNote =
     requestedPage !== page ? `\n> page:${requestedPage} は範囲外だったため ${page} ページ目を表示しています。` : "";
   const summaryNote = summary === "" ? "" : `\n分類: ${summary}`;
+  const pagePrograms = programs.size > 0 ? programs : await getProgramsForDisplay(ctx.baseUrl, pageItems, logger);
   const lines = pageItems.map((channel, index) => {
     const lineNumber = startIndex + index + 1;
-    return `${lineNumber}. ${buildChannelChoiceLabel(channel, duplicateBaseLabels)}`;
+    const baseLine = `${lineNumber}. ${buildChannelChoiceLabel(channel, duplicateBaseLabels)}`;
+    const programName =
+      getProgramName(pagePrograms.get(buildChannelProgramCacheKey(ctx.baseUrl, channel))) ??
+      getProgramNameFromCache(ctx.baseUrl, channel);
+    return programName ? `${baseLine} - ${truncateText(programName, LIST_PROGRAM_NAME_LIMIT)}` : baseLine;
   });
   const hint =
     query === ""
@@ -234,6 +277,7 @@ async function executeReload(
     const discovered = await discoverAllChannels(ctx.baseUrl, ctx.bonDrivers, logger, ctx.tuningDelays);
     ctx.channels.length = 0;
     ctx.channels.push(...discovered);
+    clearProgramCache(ctx.baseUrl);
 
     await interaction.editReply({
       content: `チャンネル一覧を更新しました。${discovered.length} チャンネルを検出しました。`,
@@ -252,7 +296,7 @@ export async function handleTvInteraction(
   logger: Logger,
 ): Promise<void> {
   if (interaction.isAutocomplete() && interaction.commandName === TV_COMMAND_NAME) {
-    handleTvAutocomplete(interaction, ctx);
+    await handleTvAutocomplete(interaction, ctx, logger);
     return;
   }
 
@@ -266,7 +310,7 @@ export async function handleTvInteraction(
     if (subcommand === SUBCOMMAND_CHANNEL) {
       await executeChannelChange(interaction, ctx, logger);
     } else if (subcommand === SUBCOMMAND_LIST) {
-      await executeList(interaction, ctx);
+      await executeList(interaction, ctx, logger);
     } else if (subcommand === SUBCOMMAND_STATUS) {
       await executeStatus(interaction, ctx, logger);
     } else if (subcommand === SUBCOMMAND_RELOAD) {
@@ -302,11 +346,332 @@ function getDuplicateBaseLabels(channels: UnifiedChannel[]): Set<string> {
   );
 }
 
+async function searchChannelsForAutocomplete(
+  baseUrl: string,
+  channels: readonly UnifiedChannel[],
+  query: string,
+  logger: Logger,
+): Promise<SearchChannelsResult> {
+  if (normalizeSearchText(query) === "") {
+    const matches = searchChannels([...channels], query);
+    const programs = await getProgramsForDisplay(baseUrl, matches, logger);
+    return { matches, programs };
+  }
+
+  return searchChannelsWithPrograms(baseUrl, channels, query, logger, AUTOCOMPLETE_RESULT_LIMIT);
+}
+
+async function searchChannelsForList(
+  baseUrl: string,
+  channels: readonly UnifiedChannel[],
+  query: string,
+  logger: Logger,
+): Promise<SearchChannelsResult> {
+  if (normalizeSearchText(query) === "") {
+    return { matches: searchChannelsByMetadata(channels, query), programs: new Map() };
+  }
+
+  return searchChannelsWithPrograms(baseUrl, channels, query, logger);
+}
+
+async function findChannelForQuery(
+  baseUrl: string,
+  channels: readonly UnifiedChannel[],
+  query: string,
+  logger: Logger,
+): Promise<UnifiedChannel | undefined> {
+  const directMatch = findChannel([...channels], query);
+  if (directMatch) {
+    return directMatch;
+  }
+
+  const { matches } = await searchChannelsWithPrograms(baseUrl, channels, query, logger, 1);
+  return matches[0];
+}
+
+async function searchChannelsWithPrograms(
+  baseUrl: string,
+  channels: readonly UnifiedChannel[],
+  query: string,
+  logger: Logger,
+  limit?: number,
+): Promise<SearchChannelsResult> {
+  const normalizedQuery = normalizeSearchText(query);
+  if (normalizedQuery === "") {
+    const matches = searchChannelsByMetadata(channels, query);
+    return {
+      matches: limit ? matches.slice(0, limit) : matches,
+      programs: new Map(),
+    };
+  }
+
+  const programs = await getProgramsForDisplay(baseUrl, channels, logger);
+  const matches = rankChannelsWithPrograms(baseUrl, channels, programs, normalizedQuery).map((match) => match.channel);
+
+  return {
+    matches: limit ? matches.slice(0, limit) : matches,
+    programs,
+  };
+}
+
+async function getProgramsForDisplay(
+  baseUrl: string,
+  channels: readonly UnifiedChannel[],
+  logger: Logger,
+): Promise<Map<string, TvTestChannelProgramResult>> {
+  const results = new Map<string, TvTestChannelProgramResult>();
+  const now = Date.now();
+  const uncachedChannels: UnifiedChannel[] = [];
+
+  channels.forEach((channel) => {
+    const key = buildChannelProgramCacheKey(baseUrl, channel);
+    const cached = channelProgramCache.get(key);
+
+    if (cached && cached.expiresAtMs > now) {
+      results.set(key, cached.result);
+      return;
+    }
+
+    channelProgramCache.delete(key);
+    uncachedChannels.push(channel);
+  });
+
+  if (uncachedChannels.length === 0) {
+    return results;
+  }
+
+  try {
+    const fetched = await tvGetProgramsForChannels(
+      baseUrl,
+      uncachedChannels.map((channel) => buildProgramQuery(channel)),
+    );
+
+    fetched.forEach((result, index) => {
+      const channel = uncachedChannels[index];
+      if (!channel) {
+        return;
+      }
+
+      const key = buildChannelProgramCacheKey(baseUrl, channel);
+      channelProgramCache.set(key, {
+        expiresAtMs: now + CHANNEL_PROGRAM_CACHE_TTL_MS,
+        result,
+      });
+      results.set(key, result);
+    });
+  } catch (error) {
+    logger.warn("Failed to fetch current TV programs for channel display.", error);
+  }
+
+  return results;
+}
+
+function clearProgramCache(baseUrl: string): void {
+  const prefix = `${baseUrl.replace(/\/$/, "")}::`;
+
+  for (const key of channelProgramCache.keys()) {
+    if (key.startsWith(prefix)) {
+      channelProgramCache.delete(key);
+    }
+  }
+}
+
+function buildChannelProgramCacheKey(baseUrl: string, channel: UnifiedChannel): string {
+  return `${baseUrl.replace(/\/$/, "")}::${channel.driver}::${channel.space}::${channel.channel}`;
+}
+
+function getProgramNameFromCache(baseUrl: string, channel: UnifiedChannel): string | undefined {
+  const key = buildChannelProgramCacheKey(baseUrl, channel);
+  const cached = channelProgramCache.get(key);
+  if (!cached || cached.expiresAtMs <= Date.now()) {
+    return undefined;
+  }
+
+  return getProgramName(cached.result);
+}
+
+function buildProgramQuery(channel: UnifiedChannel): { networkId: number; serviceId: number } | { space: number; channel: number } {
+  if (channel.networkId > 0 && channel.serviceId > 0) {
+    return {
+      networkId: channel.networkId,
+      serviceId: channel.serviceId,
+    };
+  }
+
+  return {
+    space: channel.space,
+    channel: channel.channel,
+  };
+}
+
+function searchChannelsByMetadata(channels: readonly UnifiedChannel[], query: string): UnifiedChannel[] {
+  return normalizeSearchText(query) === "" ? [...channels].sort(compareChannelsForDisplay) : rankChannelsByMetadata(channels, query);
+}
+
+function rankChannelsByMetadata(channels: readonly UnifiedChannel[], query: string): UnifiedChannel[] {
+  const normalizedQuery = normalizeSearchText(query);
+  if (normalizedQuery === "") {
+    return [...channels].sort(compareChannelsForDisplay);
+  }
+
+  return channels
+    .map((channel, index) => {
+      const displayName = normalizeSearchText(channel.displayName);
+      const networkName = normalizeSearchText(channel.networkName);
+      const driverName = normalizeSearchText(channel.driver);
+
+      const score = Math.min(
+        getMatchScore(displayName, normalizedQuery, 0),
+        getMatchScore(networkName, normalizedQuery, 40),
+        getMatchScore(driverName, normalizedQuery, 80),
+      );
+
+      if (!Number.isFinite(score)) {
+        return undefined;
+      }
+
+      return { channel, score, index };
+    })
+    .filter((match): match is RankedChannelWithProgram => match !== undefined)
+    .sort(compareRankedChannels)
+    .map((match) => match.channel);
+}
+
+function rankChannelsWithPrograms(
+  baseUrl: string,
+  channels: readonly UnifiedChannel[],
+  programs: ReadonlyMap<string, TvTestChannelProgramResult>,
+  normalizedQuery: string,
+): RankedChannelWithProgram[] {
+  return channels
+    .map((channel, index) => {
+      const displayName = normalizeSearchText(channel.displayName);
+      const networkName = normalizeSearchText(channel.networkName);
+      const driverName = normalizeSearchText(channel.driver);
+      const programName = normalizeSearchText(
+        getProgramName(programs.get(buildChannelProgramCacheKey(baseUrl, channel))) ?? "",
+      );
+
+      const score = Math.min(
+        getMatchScore(displayName, normalizedQuery, 0),
+        getMatchScore(programName, normalizedQuery, 20),
+        getMatchScore(networkName, normalizedQuery, 40),
+        getMatchScore(driverName, normalizedQuery, 80),
+      );
+
+      if (!Number.isFinite(score)) {
+        return undefined;
+      }
+
+      return { channel, score, index };
+    })
+    .filter((match): match is RankedChannelWithProgram => match !== undefined)
+    .sort(compareRankedChannels);
+}
+
+function compareRankedChannels(left: RankedChannelWithProgram, right: RankedChannelWithProgram): number {
+  if (left.score !== right.score) {
+    return left.score - right.score;
+  }
+
+  return compareChannelsForDisplay(left.channel, right.channel) || left.index - right.index;
+}
+
+function compareChannelsForDisplay(left: UnifiedChannel, right: UnifiedChannel): number {
+  const displayNameOrder = left.displayName.localeCompare(right.displayName, "ja");
+  if (displayNameOrder !== 0) {
+    return displayNameOrder;
+  }
+
+  const networkNameOrder = left.networkName.localeCompare(right.networkName, "ja");
+  if (networkNameOrder !== 0) {
+    return networkNameOrder;
+  }
+
+  const driverOrder = left.driver.localeCompare(right.driver, "ja");
+  if (driverOrder !== 0) {
+    return driverOrder;
+  }
+
+  if (left.space !== right.space) {
+    return left.space - right.space;
+  }
+
+  return left.channel - right.channel;
+}
+
+function buildAutocompleteChoiceName(
+  channel: UnifiedChannel,
+  duplicateBaseLabels: ReadonlySet<string>,
+  programResult?: TvTestChannelProgramResult,
+): string {
+  const baseLabel = buildChannelChoiceLabel(channel, duplicateBaseLabels);
+  const programName = getProgramName(programResult);
+
+  if (!programName) {
+    return truncateText(baseLabel, AUTOCOMPLETE_CHOICE_NAME_LIMIT);
+  }
+
+  const separator = " - ";
+  const availableProgramLength = AUTOCOMPLETE_CHOICE_NAME_LIMIT - baseLabel.length - separator.length;
+  if (availableProgramLength <= 0) {
+    return truncateText(baseLabel, AUTOCOMPLETE_CHOICE_NAME_LIMIT);
+  }
+
+  return `${baseLabel}${separator}${truncateText(programName, availableProgramLength)}`;
+}
+
+function getProgramName(programResult?: TvTestChannelProgramResult): string | undefined {
+  if (programResult?.status !== "available") {
+    return undefined;
+  }
+
+  const name = programResult.program?.name?.trim();
+  return name ? name : undefined;
+}
+
+function getMatchScore(value: string, query: string, baseScore: number): number {
+  if (value === "") {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (value === query) {
+    return baseScore;
+  }
+
+  if (value.startsWith(query)) {
+    return baseScore + 10;
+  }
+
+  const position = value.indexOf(query);
+  if (position === -1) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return baseScore + 20 + position;
+}
+
+function truncateText(value: string, limit: number): string {
+  if (value.length <= limit) {
+    return value;
+  }
+
+  if (limit <= 3) {
+    return value.slice(0, limit);
+  }
+
+  return `${value.slice(0, limit - 3)}...`;
+}
+
 function isSameChannelName(left: string, right: string): boolean {
   return normalizeChannelName(left) === normalizeChannelName(right);
 }
 
 function normalizeChannelName(value: string): string {
+  return normalizeSearchText(value);
+}
+
+function normalizeSearchText(value: string): string {
   return value
     .normalize("NFKC")
     .toLowerCase()
