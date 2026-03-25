@@ -1,3 +1,4 @@
+import { ActivityType } from "discord.js";
 import { loadConfig, type AppConfig } from "./config.js";
 import {
   createDiscordClient,
@@ -16,6 +17,9 @@ import {
 } from "./slash-command-registration.js";
 import { discoverAllChannels } from "./tv-channels.js";
 import { buildTvCommandPayload, type TvCommandContext } from "./tv-commands.js";
+import { tvGetStatus } from "./tvtest.js";
+
+const TV_PRESENCE_POLL_INTERVAL_MS = 30_000;
 
 const logger = createLogger();
 
@@ -117,8 +121,31 @@ client.once("ready", () => {
       await client.destroy();
       process.exit(1);
     }
+
+    if (tvCtx !== null) {
+      void updateTvPresence(tvCtx.baseUrl);
+      setInterval(() => void updateTvPresence(tvCtx.baseUrl), TV_PRESENCE_POLL_INTERVAL_MS);
+    }
   })();
 });
+
+async function updateTvPresence(baseUrl: string): Promise<void> {
+  try {
+    const status = await tvGetStatus(baseUrl);
+    const channelName = status.channel?.name?.trim() ?? "";
+    if (!channelName) {
+      client.user?.setPresence({ activities: [] });
+      return;
+    }
+    const programName = status.program?.name?.trim() ?? "";
+    const activityName = programName ? `${programName} : ${channelName}` : channelName;
+    client.user?.setPresence({
+      activities: [{ name: activityName, type: ActivityType.Watching }],
+    });
+  } catch {
+    client.user?.setPresence({ activities: [] });
+  }
+}
 
 client.on("interactionCreate", (interaction) => {
   if (tvCtx !== null) {
