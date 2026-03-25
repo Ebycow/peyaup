@@ -1,6 +1,7 @@
 import {
   Client,
   GatewayIntentBits,
+  type RESTPostAPIChatInputApplicationCommandsJSONBody,
   type ChatInputCommandInteraction,
   type GuildMember,
   type Interaction,
@@ -18,6 +19,7 @@ import {
   formatProbabilityPercent,
   formatSlotGrid,
 } from "./spin.js";
+import { handleTvInteraction, type TvCommandContext } from "./tv-commands.js";
 
 const SPIN_COMMAND_NAME = "spin";
 const SPIN_RATE_COMMAND_NAME = "spin-rate";
@@ -31,7 +33,7 @@ const SPIN_COMMAND_PAYLOADS = [
     name: SPIN_RATE_COMMAND_NAME,
     description: "このサーバーでの /spin 当選確率を表示する",
   },
-] as const;
+] satisfies readonly RESTPostAPIChatInputApplicationCommandsJSONBody[];
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -107,22 +109,8 @@ export async function notifyIncident(client: Client, config: AppConfig): Promise
   });
 }
 
-export async function registerSpinCommands(client: Client, guildId: string, logger: Logger): Promise<void> {
-  const guild = await client.guilds.fetch(guildId);
-  const guildCommands = await guild.commands.fetch();
-  for (const payload of SPIN_COMMAND_PAYLOADS) {
-    const existing = guildCommands.find((command) => command.name === payload.name);
-
-    if (existing) {
-      await guild.commands.edit(existing.id, payload);
-      logger.info(`Guild slash command /${payload.name} updated for guild ${guildId}.`);
-      continue;
-    }
-
-    await guild.commands.create(payload);
-    logger.info(`Guild slash command /${payload.name} created for guild ${guildId}.`);
-  }
-
+export function getSpinCommandPayloads(): readonly RESTPostAPIChatInputApplicationCommandsJSONBody[] {
+  return SPIN_COMMAND_PAYLOADS;
 }
 
 async function executeSpin(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -196,6 +184,14 @@ async function executeSpinRate(interaction: ChatInputCommandInteraction): Promis
   await interaction.reply({
     content: `このサーバーでの /spin 当選確率は **${percentage}** です。（絵文字 ${emojiCount} 個・3x3・8ライン判定）`,
   });
+}
+
+export async function handleTvCommandInteraction(
+  interaction: Interaction,
+  ctx: TvCommandContext,
+  logger: Logger,
+): Promise<void> {
+  await handleTvInteraction(interaction, ctx, logger);
 }
 
 export async function handleSpinInteraction(interaction: Interaction, logger: Logger): Promise<void> {

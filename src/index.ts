@@ -2,13 +2,20 @@ import { loadConfig, type AppConfig } from "./config.js";
 import {
   createDiscordClient,
   fetchWatchState,
+  getSpinCommandPayloads,
   handleSpinInteraction,
+  handleTvCommandInteraction,
   notifyIncident,
-  registerSpinCommands,
   snapshotFromVoiceState,
 } from "./discord.js";
 import { createLogger } from "./logger.js";
 import { StreamMonitor } from "./monitor.js";
+import {
+  syncSlashCommandScope,
+  type SlashCommandPayload,
+} from "./slash-command-registration.js";
+import { discoverAllChannels } from "./tv-channels.js";
+import { buildTvCommandPayload, type TvCommandContext } from "./tv-commands.js";
 
 const logger = createLogger();
 
@@ -33,14 +40,73 @@ const monitor = new StreamMonitor({
   notifyIncident: () => notifyIncident(client, config),
 });
 
+// TVTEST_API_URL が設定されている場合のみ TV 機能を有効化
+const tvCtx: TvCommandContext | null =
+  config.tvtestApiUrl !== null
+    ? {
+        baseUrl: config.tvtestApiUrl,
+        bonDrivers: config.tvtestBonDrivers,
+        tuningDelays: config.tvtestTuningDelays,
+        channels: [],
+      }
+    : null;
+
 client.once("ready", () => {
   void (async () => {
     logger.info(`Logged in as ${client.user?.tag ?? "unknown"}.`);
 
+    const guildCommandPayloads: SlashCommandPayload[] = [...getSpinCommandPayloads()];
+    if (tvCtx !== null) {
+      guildCommandPayloads.push(buildTvCommandPayload());
+    }
+
     try {
-      await registerSpinCommands(client, config.guildId, logger);
+      const guild = await client.guilds.fetch(config.guildId);
+      await syncSlashCommandScope(
+        {
+          fetchExistingCommands: () => guild.commands.fetch(),
+          replaceCommands: (payloads) => guild.commands.set(payloads),
+          scopeLabel: `guild ${config.guildId}`,
+        },
+        guildCommandPayloads,
+        logger,
+      );
     } catch (error) {
-      logger.error("Failed to register spin commands.", error);
+      logger.error("Failed to sync guild slash commands.", error);
+    }
+
+    try {
+      const application = client.application;
+      if (!application) {
+        throw new Error("Discord application is unavailable after ready.");
+      }
+
+      await syncSlashCommandScope(
+        {
+          fetchExistingCommands: () => application.commands.fetch(),
+          replaceCommands: (payloads) => application.commands.set(payloads),
+          scopeLabel: "global",
+        },
+        [],
+        logger,
+      );
+    } catch (error) {
+      logger.error("Failed to sync global slash commands.", error);
+    }
+
+    if (tvCtx !== null) {
+      try {
+        const discovered = await discoverAllChannels(
+          tvCtx.baseUrl,
+          tvCtx.bonDrivers,
+          logger,
+          tvCtx.tuningDelays,
+        );
+        tvCtx.channels.push(...discovered);
+        logger.info(`TV channel discovery complete: ${discovered.length} channels loaded.`);
+      } catch (error) {
+        logger.warn("TV channel discovery failed. /tv channel autocomplete will be empty.", error);
+      }
     }
 
     try {
@@ -55,6 +121,9 @@ client.once("ready", () => {
 });
 
 client.on("interactionCreate", (interaction) => {
+  if (tvCtx !== null) {
+    void handleTvCommandInteraction(interaction, tvCtx, logger);
+  }
   void handleSpinInteraction(interaction, logger);
 });
 
